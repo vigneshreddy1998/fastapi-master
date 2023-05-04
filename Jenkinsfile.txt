@@ -1,0 +1,67 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_ACCESS_KEY_ID = credentials('aws-access-key-id')
+    AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
+    AWS_REGION = 'us-east-1'
+    APP_NAME = 'sample-api'
+    DOCKER_IMAGE = 'sample-api:latest'
+    POSTGRES_DB = 'sampledb'
+    POSTGRES_USER = 'admin'
+    POSTGRES_PASSWORD = credentials('postgres-password')
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git 'https://github.com/marciovrl/fastapi.git'
+      }
+    }
+
+    stage('Build') {
+      steps {
+        sh 'docker build -t ${DOCKER_IMAGE} .'
+		sh 'pip install -r requirements.txt'
+        sh 'python setup.py build'
+      }
+    }
+
+    stage('Test') {
+      steps {
+        sh 'docker run --rm ${DOCKER_IMAGE} python -m pytest'
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        script {
+          def ecr = awsECR()
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+            sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ecr.registry}"
+            sh "docker tag ${DOCKER_IMAGE} ${ecr.registry}/${APP_NAME}:latest"
+            sh "docker push ${ecr.registry}/${APP_NAME}:latest"
+          }
+        }
+      }
+    }
+
+    stage('Deploy to ECS') {
+      steps {
+        script {
+          def ecs = awsECS()
+          def taskDef = readJSON(file: 'task-def.json')
+          taskDef.containerDefinitions[0].image = "${ecs.registry}/${APP_NAME}:latest"
+          taskDef.containerDefinitions[0].environment = [
+            [name: 'POSTGRES_DB', value: POSTGRES_DB],
+            [name: 'POSTGRES_USER', value: POSTGRES_USER],
+            [name: 'POSTGRES_PASSWORD', value: POSTGRES_PASSWORD]
+          ]
+          writeJSON(file: 'updated-task-def.json', json: taskDef)
+          sh "aws ecs register-task-definition --cli-input-json file://updated-task-def.json"
+          sh "aws ecs update-service --cluster ${ecs.cluster} --service ${ecs.service} --force-new-deployment"
+        }
+      }
+    }
+  }
+}
